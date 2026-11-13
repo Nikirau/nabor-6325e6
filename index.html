@@ -53,7 +53,13 @@ h1,h2,h3,p{margin:0}
 .sync{font-size:12px;color:var(--muted)}
 .who{text-decoration:none;color:var(--ink);border:1px solid var(--line);background:var(--surface);border-radius:999px;padding:6px 12px;font-size:14px;font-weight:500;max-width:46vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
+button.who{cursor:pointer}
+#peer{max-width:30vw}
+#peer.on{background:var(--btn);color:var(--btn-ink);border-color:var(--btn)}
 main{max-width:640px;margin:0 auto;padding:16px 16px 96px}
+.ro [data-act]:not([data-nav]):not(.check){display:none}
+.ro .check,.ro .field{pointer-events:none}
+.ro .sets,.ro #wnew,.ro label[for=wnew]{display:none}
 .card{background:var(--surface);border-radius:14px;padding:16px;margin-bottom:12px}
 .title{font:700 20px/1.2 var(--display);letter-spacing:-.01em;margin:4px 0 12px}
 .sub{color:var(--muted);font-size:14px}
@@ -156,6 +162,7 @@ details li{margin-bottom:6px}
 <header class="top"><div class="top-in">
   <span class="brand">Набор</span>
   <span class="sync" id="sync" aria-live="polite"></span>
+  <button class="who" id="peer" data-act="swap" hidden></button>
   <a class="who" id="who" href="#profile">Профиль</a>
 </div></header>
 <main id="view"><p class="loading">Загружаю данные…</p></main>
@@ -278,9 +285,9 @@ const shift = (s,n) => { const d = parseD(s); d.setDate(d.getDate()+n); return d
 
 /* ---------- состояние ---------- */
 function blank(){ return {
-  main:{v:1, profile:{set:false,name:'',sex:'m',age:22,height:170,weight:50.5,act:1.45,goal:'gain',customKcal:0},
+  main:{v:1, t:0, profile:{set:false,name:'',sex:'m',age:22,height:170,weight:50.5,act:1.45,goal:'gain',customKcal:0},
         customFoods:[], plan:{}, shopChecked:{}, weights:[], nextWorkout:'A', draft:{}},
-  log:{v:1, diary:{}, workouts:[]} }; }
+  log:{v:1, t:0, diary:{}, workouts:[]} }; }
 function normalize(s){
   const b = blank(); s = s || {};
   const m = Object.assign(b.main, s.main || {}); m.profile = Object.assign(blank().main.profile, (s.main||{}).profile || {});
@@ -291,22 +298,179 @@ function normalize(s){
   if(!l.diary || typeof l.diary !== 'object') l.diary = {};
   return {main:m, log:l};
 }
-let state = blank();
-const ui = {route:'today', day:todayStr(), planDay:wdIdx(todayStr()), sheet:null, ready:false};
+// mine: данные этого человека, единственное, что пишется в localStorage и в облако.
+// state: то, что сейчас показано на экране: mine или данные второго человека (только просмотр).
+let mine = blank(), state = mine;
+const ui = {route:'today', day:todayStr(), planDay:wdIdx(todayStr()), sheet:null, ready:false, who:'me'};
 
 /* ---------- хранение ---------- */
-const LS = 'nabor-v1';
+const LS = 'nabor-v1', LS_AUTH = 'nabor-auth-v1';
 function readLocal(){ try{ const t = localStorage.getItem(LS); return t ? JSON.parse(t) : null; }catch(e){ return null; } }
-function writeLocal(){ try{ localStorage.setItem(LS, JSON.stringify(state)); return true; }catch(e){ return false; } }
+function writeLocal(){ try{ localStorage.setItem(LS, JSON.stringify(mine)); return true; }catch(e){ return false; } }
 function setSync(t){ const el = $('#sync'); if(el) el.textContent = t; }
-function save(){ setSync(writeLocal() ? '' : 'не сохранено'); }
+function setMine(s){ mine = s; if(ui.who === 'me') state = s; }
+function save(which){
+  if(ui.who !== 'me') return;
+  if(mine[which]) mine[which].t = Date.now();
+  setSync(writeLocal() ? '' : 'не сохранено');
+  if(cloud.auth){ cloud.dirty = true; later(1500); }
+}
 function init(){
   const local = readLocal();
-  if(local) state = normalize(local);
+  if(local) setMine(normalize(local));
   ui.ready = true;
-  if(!state.main.profile.set) location.hash = 'profile';
+  if(!mine.main.profile.set) location.hash = 'profile';
   route();
+  syncNow();
 }
+
+/* ---------- облако: данные для двоих (Firebase REST, правила и настройка в CLAUDE.md) ---------- */
+// apiKey и projectId не секрет: доступ защищают правила базы. Пока они пусты, облачная часть скрыта.
+const FB = {
+  apiKey:'', projectId:'',
+  auth:'https://identitytoolkit.googleapis.com/v1/accounts:', token:'https://securetoken.googleapis.com/v1/token',
+  db(){ return 'https://firestore.googleapis.com/v1/projects/' + this.projectId + '/databases/(default)/documents'; }
+};
+const cloudOn = () => !!(FB.apiKey && FB.projectId);
+const cloud = {auth:readAuth(), peer:null, dirty:false, run:false, fails:0, fetched:0, timer:null, lastErr:null};
+function readAuth(){ try{ return JSON.parse(localStorage.getItem(LS_AUTH)); }catch(e){ return null; } }
+function writeAuth(a){ try{ if(a) localStorage.setItem(LS_AUTH, JSON.stringify(a)); else localStorage.removeItem(LS_AUTH); }catch(e){} }
+async function http(url, opt){
+  const r = await fetch(url, opt);
+  let body = null; try{ body = await r.json(); }catch(e){}
+  if(!r.ok){ const err = new Error((body && body.error && (body.error.message || body.error.status)) || String(r.status)); err.status = r.status; throw err; }
+  return body;
+}
+async function signIn(email, password){
+  const r = await http(FB.auth + 'signInWithPassword?key=' + FB.apiKey, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email, password, returnSecureToken:true})});
+  return {uid:r.localId, email:r.email, idToken:r.idToken, refreshToken:r.refreshToken, exp:Date.now() + (+r.expiresIn) * 1000};
+}
+async function idToken(){
+  const a = cloud.auth;
+  if(a.exp - Date.now() > 60000) return a.idToken;
+  let r;
+  try{ r = await http(FB.token + '?key=' + FB.apiKey, {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'grant_type=refresh_token&refresh_token=' + encodeURIComponent(a.refreshToken)}); }
+  catch(e){ if(e.status === 400 || e.status === 401) e.relogin = true; throw e; }
+  Object.assign(a, {idToken:r.id_token, refreshToken:r.refresh_token, exp:Date.now() + (+r.expires_in) * 1000}); writeAuth(a);
+  return a.idToken;
+}
+async function api(path, opt){
+  opt = opt || {};
+  const tk = await idToken();
+  return http(FB.db() + path, Object.assign({}, opt, {headers:Object.assign({Authorization:'Bearer ' + tk}, opt.headers)}));
+}
+// Документ people/{uid}: name, email, t (время последней правки), main и log (JSON-строки).
+const fstr = v => ({stringValue:String(v == null ? '' : v)});
+const gstr = f => (f && f.stringValue) || '';
+function gjson(f){ try{ const o = JSON.parse(gstr(f)); return o && typeof o === 'object' ? o : null; }catch(e){ return null; } }
+function docBody(){
+  return {fields:{name:fstr(mine.main.profile.name), email:fstr(cloud.auth.email), t:{integerValue:String(Math.max(mine.main.t || 0, mine.log.t || 0))},
+    main:fstr(JSON.stringify(mine.main)), log:fstr(JSON.stringify(mine.log))}};
+}
+// Своё: побеждает более поздняя правка (t) отдельно для main и log.
+async function pullMine(first){
+  let d = null;
+  try{ d = await api('/people/' + cloud.auth.uid); }catch(e){ if(e.status !== 404) throw e; }
+  if(!d){
+    if(mine.main.profile.set){ mine.main.t = mine.main.t || Date.now(); mine.log.t = mine.log.t || Date.now(); writeLocal(); cloud.dirty = true; }
+    return false;
+  }
+  const rm = gjson(d.fields && d.fields.main), rl = gjson(d.fields && d.fields.log);
+  const takeM = !!rm && (rm.t || 0) > (mine.main.t || 0), takeL = !!rl && (rl.t || 0) > (mine.log.t || 0);
+  if(first && mine.main.profile.set && !mine.main.t && !mine.log.t && (takeM || takeL)
+     && !confirm('В облаке уже есть твои данные. Заменить ими данные на этом устройстве?')){ const e = new Error('cancelled'); e.cancelled = true; throw e; }
+  if(takeM || takeL){ setMine(normalize({main:takeM ? rm : mine.main, log:takeL ? rl : mine.log})); writeLocal(); }
+  if((!takeM && (mine.main.t || 0) > ((rm && rm.t) || 0)) || (!takeL && (mine.log.t || 0) > ((rl && rl.t) || 0))) cloud.dirty = true;
+  return takeM || takeL;
+}
+async function pullPeer(){
+  const r = await api('/people?pageSize=20');
+  const d = (r.documents || []).find(x => !x.name.endsWith('/' + cloud.auth.uid));
+  const before = cloud.peer ? cloud.peer.t : null;
+  if(!d){ cloud.peer = null; return before !== null; }
+  const f = d.fields || {}, t = +((f.t || {}).integerValue || 0);
+  cloud.peer = {name:gstr(f.name), email:gstr(f.email), t, state:normalize({main:gjson(f.main) || undefined, log:gjson(f.log) || undefined})};
+  if(ui.who === 'partner') state = cloud.peer.state;
+  return before !== t;
+}
+async function pushNow(){
+  if(!cloud.dirty) return;
+  cloud.dirty = false;
+  try{ await api('/people/' + cloud.auth.uid, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify(docBody())}); }
+  catch(e){ cloud.dirty = true; throw e; }
+}
+async function withLock(fn){
+  if(cloud.run) return false;
+  cloud.run = true;
+  try{ await fn(); cloud.fails = 0; cloud.lastErr = null; return true; }
+  catch(e){ cloud.lastErr = e; cloudFail(e); return false; }
+  finally{ cloud.run = false; }
+}
+function cloudFail(e){
+  cloud.fails++;
+  if(e.cancelled){ cloudSignOut(); toast('Вход отменён, данные на устройстве не тронуты'); return; }
+  if(e.relogin){ cloud.auth = null; writeAuth(null); setSync('войди снова'); softRender(); return; }
+  if(e.status === 403){ setSync('нет доступа к облаку'); return; }
+  setSync('нет связи');
+  if(cloud.fails < 5 && cloud.dirty) later(10000 * cloud.fails);
+}
+function later(ms){ clearTimeout(cloud.timer); cloud.timer = setTimeout(flush, ms); }
+async function flush(){
+  if(!cloudOn() || !cloud.auth) return;
+  if(cloud.run){ later(1000); return; }
+  setSync('сохраняю…');
+  if(await withLock(pushNow)){ setSync(''); if(cloud.dirty) later(300); }
+}
+async function syncNow(first){
+  if(!cloudOn() || !cloud.auth || cloud.run) return false;
+  setSync('синхронизирую…');
+  let changed = false;
+  const ok = await withLock(async () => {
+    changed = await pullMine(first);
+    await pushNow();
+    changed = (await pullPeer()) || changed;
+  });
+  if(ok){
+    cloud.fetched = Date.now(); setSync('');
+    if(ui.who === 'partner' && !cloud.peer) setWho('me'); else if(changed) softRender();
+  }
+  return ok;
+}
+function cloudSignOut(){
+  cloud.auth = null; cloud.peer = null; cloud.dirty = false; clearTimeout(cloud.timer); writeAuth(null); setSync('');
+  if(ui.who === 'partner') setWho('me');
+}
+function setWho(w){
+  const peer = w === 'partner' && cloud.peer;
+  ui.who = peer ? 'partner' : 'me'; state = peer ? cloud.peer.state : mine;
+  ui.sheet = null; renderSheet(); render();
+}
+function softRender(){
+  const a = document.activeElement;
+  if(ui.ready && !(a && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName))) render();
+}
+function authMsg(e){
+  const m = String(e.message);
+  if(/INVALID_LOGIN_CREDENTIALS|INVALID_PASSWORD|EMAIL_NOT_FOUND/.test(m)) return 'Неверная почта или пароль';
+  if(m.includes('INVALID_EMAIL')) return 'Проверь адрес почты';
+  if(m.includes('TOO_MANY_ATTEMPTS')) return 'Слишком много попыток, подожди немного';
+  return e.status ? 'Не удалось войти' : 'Нет связи с интернетом';
+}
+async function cloudLogin(){
+  const email = $('#s-email').value.trim(), pw = $('#s-pass').value;
+  if(!email || !pw){ toast('Укажи почту и пароль'); return; }
+  setSync('вхожу…');
+  try{ cloud.auth = await signIn(email, pw); }
+  catch(e){ setSync(''); toast(authMsg(e)); return; }
+  writeAuth(cloud.auth); cloud.fails = 0;
+  const ok = await syncNow(true);
+  if(ok) toast('Синхронизация включена');
+  else if(cloud.auth) toast(cloud.lastErr && cloud.lastErr.status === 403 ? 'Нет доступа: этой почты нет в правилах базы' : 'Не удалось синхронизировать');
+  render();
+}
+document.addEventListener('visibilitychange', () => { if(!document.hidden && !cloud.dirty && Date.now() - cloud.fetched > 30000) syncNow(); });
+window.addEventListener('online', () => syncNow());
+setInterval(() => { if(!document.hidden && !cloud.dirty && Date.now() - cloud.fetched > 90000) syncNow(); }, 30000);
 
 /* ---------- расчёты ---------- */
 function targets(p){
@@ -332,14 +496,20 @@ function amount(f, g){
 function route(){
   const h = location.hash.replace('#','');
   ui.route = ['today','menu','shop','train','progress','profile'].includes(h) ? h : 'today';
+  if(ui.route === 'profile' && ui.who !== 'me'){ ui.who = 'me'; state = mine; }
   render();
 }
 function render(){
   $('#tabs').innerHTML = TABS.map(t => `<a class="tab${ui.route===t[0]?' on':''}" href="#${t[0]}"${ui.route===t[0]?' aria-current="page"':''}><svg viewBox="0 0 24 24" aria-hidden="true">${t[2]}</svg>${t[1]}</a>`).join('');
-  $('#who').textContent = state.main.profile.name || 'Профиль';
+  $('#who').textContent = mine.main.profile.name || 'Профиль';
+  const hasPeer = cloudOn() && !!cloud.auth && !!cloud.peer, pb = $('#peer');
+  pb.hidden = !hasPeer; pb.classList.toggle('on', ui.who === 'partner');
+  if(hasPeer) pb.textContent = ui.who === 'me' ? (cloud.peer.name || 'Второй') : 'Мои данные';
+  $('#view').className = ui.who === 'partner' ? 'ro' : '';
   if(!ui.ready){ $('#view').innerHTML = '<p class="loading">Загружаю данные…</p>'; return; }
   const v = {today:viewToday, menu:viewMenu, shop:viewShop, train:viewTrain, progress:viewProgress, profile:viewProfile}[ui.route];
-  $('#view').innerHTML = v();
+  const upd = ui.who === 'partner' && cloud.peer.t ? ' Обновлено ' + new Date(cloud.peer.t).toLocaleString('ru-RU', {day:'numeric', month:'short', hour:'2-digit', minute:'2-digit'}) + '.' : '';
+  $('#view').innerHTML = (ui.who === 'partner' ? `<p class="note" style="margin:0 0 12px">Ты смотришь данные: <b>${esc(cloud.peer.name || cloud.peer.email)}</b>. Только просмотр.${upd}</p>` : '') + v();
 }
 function hero(t, tg, label){
   const pct = tg.kcal ? t.k / tg.kcal : 0, on = Math.min(20, Math.round(pct*20));
@@ -368,9 +538,9 @@ function viewToday(){
   const tg = targets(state.main.profile), day = state.log.diary[ui.day], t = sumDay(day);
   const isToday = ui.day === todayStr(), planned = state.main.plan[wdIdx(ui.day)];
   return `<section class="card">
-   <div class="datebar"><button class="ic" data-act="day" data-n="-1" aria-label="Предыдущий день">‹</button>
+   <div class="datebar"><button class="ic" data-act="day" data-nav data-n="-1" aria-label="Предыдущий день">‹</button>
     <span>${isToday ? 'Сегодня, ' : ''}${fmtDate(ui.day)}</span>
-    <button class="ic" data-act="day" data-n="1" aria-label="Следующий день">›</button></div>
+    <button class="ic" data-act="day" data-nav data-n="1" aria-label="Следующий день">›</button></div>
    ${hero(t, tg, 'Осталось')}
   </section>
   ${dayEmpty(day) && !dayEmpty(planned) ? '<button class="btn wide" data-act="fill" style="margin-bottom:12px">Заполнить день из меню</button>' : ''}
@@ -379,7 +549,7 @@ function viewToday(){
 function viewMenu(){
   const tg = targets(state.main.profile), day = state.main.plan[ui.planDay], t = sumDay(day);
   return `<h1 class="title">Меню на неделю</h1>
-  <div class="chips" role="tablist">${DAYS.map((d,i) => `<button class="chip${i===ui.planDay?' on':''}" data-act="pday" data-i="${i}" role="tab" aria-selected="${i===ui.planDay}">${d}</button>`).join('')}</div>
+  <div class="chips" role="tablist">${DAYS.map((d,i) => `<button class="chip${i===ui.planDay?' on':''}" data-act="pday" data-nav data-i="${i}" role="tab" aria-selected="${i===ui.planDay}">${d}</button>`).join('')}</div>
   <section class="card">${hero(t, tg, 'До нормы не хватает')}</section>
   ${dayEmpty(day) ? '<p class="empty">На этот день пока ничего нет. Добавь продукты в приёмы пищи, и список покупок соберётся сам.</p>' : ''}
   ${meals(day, 'plan')}
@@ -480,6 +650,16 @@ function viewProgress(){
   ${ws.length ? `<section class="card"><h2 style="font:600 16px/1.2 var(--body)">Записи</h2><ul class="list">${ws.slice(-10).reverse().map(x => `<li><div class="nm">${fmtDate(x.d)}</div><span class="kc">${n1(x.w)} кг</span><button class="x" data-act="delwt" data-d="${x.d}" aria-label="Удалить запись ${fmtDate(x.d)}">×</button></li>`).join('')}</ul></section>` : ''}
   <section class="card"><p class="sub">Тренировок записано: <b style="color:var(--ink)">${state.log.workouts.length}</b></p></section>`;
 }
+function cloudCard(){
+  if(!cloudOn()) return '';
+  const h = '<section class="card"><h2 style="font:600 16px/1.2 var(--body);margin-bottom:6px">Синхронизация</h2>';
+  if(cloud.auth) return h + `<p class="sub" style="margin-bottom:12px">Вход выполнен: ${esc(cloud.auth.email)}.<br>${cloud.peer ? 'Второй человек: ' + esc(cloud.peer.name || cloud.peer.email) + '.' : 'Второй человек пока не появился.'}</p>
+   <div class="stack"><button class="btn ghost" data-act="syncnow">Синхронизировать сейчас</button><button class="btn ghost" data-act="signout">Выйти</button></div></section>`;
+  return h + `<p class="sub" style="margin-bottom:12px">Войди своей почтой на всех своих устройствах, и данные будут общими. Второй человек входит со своей почтой, и вы видите прогресс друг друга.</p>
+   <div class="form"><label class="f">Почта<input class="field" id="s-email" type="email" autocomplete="username" inputmode="email"></label>
+   <label class="f">Пароль<input class="field" id="s-pass" type="password" autocomplete="current-password"></label>
+   <button class="btn" data-act="signin">Войти</button></div></section>`;
+}
 function viewProfile(){
   const p = state.main.profile, tg = targets(p);
   const opt = (v, cur, label) => `<option value="${v}"${String(v)===String(cur)?' selected':''}>${label}</option>`;
@@ -501,8 +681,9 @@ function viewProfile(){
    <button class="btn" data-act="saveprofile">Сохранить профиль</button>
   </div></section>
   ${p.set ? `<section class="card"><div class="stats" style="margin-top:0"><div><b>${nf(tg.tdee)}</b><small>поддержание, ккал</small></div><div><b>${nf(tg.kcal)}</b><small>норма, ккал</small></div><div><b>${tg.p}/${tg.f}/${tg.c}</b><small>Б/Ж/У, г</small></div></div></section>` : ''}
+  ${cloudCard()}
   <section class="card"><h2 style="font:600 16px/1.2 var(--body);margin-bottom:6px">Копия данных</h2>
-   <p class="sub" style="margin-bottom:12px">Данные хранятся только в этом браузере. Чтобы перенести их на другое устройство, скачай копию и загрузи её там.</p>
+   <p class="sub" style="margin-bottom:12px">${cloud.auth ? 'Копия на случай, если что-то пойдёт не так: файл с твоими данными можно сохранить и загрузить обратно.' : 'Данные хранятся только в этом браузере. Чтобы перенести их на другое устройство, скачай копию и загрузи её там.'}</p>
    <div class="stack"><button class="btn ghost" data-act="export">Скачать копию данных</button><button class="btn ghost" data-act="import">Загрузить копию</button></div>
   </section>`;
 }
@@ -615,7 +796,11 @@ const ACT = {
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
     toast('Копия скачана');
   },
-  import(){ $('#import-file').click(); }
+  import(){ $('#import-file').click(); },
+  signin(){ cloudLogin(); },
+  signout(){ cloudSignOut(); render(); toast('Вышел, данные на устройстве остались'); },
+  syncnow(){ syncNow().then(ok => { toast(ok ? 'Синхронизировано' : 'Не удалось синхронизировать'); render(); }); },
+  swap(){ setWho(ui.who === 'me' ? 'partner' : 'me'); window.scrollTo(0,0); }
 };
 function parseBackup(text){
   const doc = JSON.parse(text);
@@ -632,16 +817,19 @@ $('#import-file').addEventListener('change', async e => {
   let s;
   try{ s = parseBackup(await file.text()); }catch(err){ toast('Не удалось прочитать файл копии'); return; }
   if(!confirm('Заменить все данные в этом браузере данными из файла? Текущие данные будут потеряны.')) return;
-  state = s; save(); ui.day = todayStr(); ui.planDay = wdIdx(ui.day); ui.sheet = null; renderSheet();
+  setMine(s); save('main'); save('log'); ui.day = todayStr(); ui.planDay = wdIdx(ui.day); ui.sheet = null; renderSheet();
   if(!state.main.profile.set && location.hash !== '#profile') location.hash = 'profile'; else render();
   toast('Данные загружены');
 });
 document.addEventListener('click', e => {
   const el = e.target.closest('[data-act]'); if(!el || el.disabled) return;
-  const fn = ACT[el.dataset.act]; if(fn){ e.preventDefault(); fn(el.dataset); }
+  const fn = ACT[el.dataset.act];
+  if(fn && ui.who === 'partner' && !['day','pday','swap'].includes(el.dataset.act)) return; // чужие данные только для просмотра
+  if(fn){ e.preventDefault(); fn(el.dataset); }
 });
 document.addEventListener('input', e => {
   const t = e.target;
+  if(ui.who !== 'me') return;
   if(t.id === 'q' && ui.sheet){ ui.sheet.q = t.value; $('#foodlist').innerHTML = foodList(t.value); }
   else if(t.id === 'grams' && ui.sheet){ ui.sheet.g = num(t.value); $('#preview').textContent = previewText(food(ui.sheet.sel), ui.sheet.g); }
   else if(t.dataset.set){
