@@ -10,6 +10,10 @@
 - `icons/`: `icon-192.png`, `icon-512.png` (подходят и как maskable), `apple-touch-icon.png` для iOS. Иконка сгенерирована скриптом: штанга на тёмном фоне.
 - `.claude/launch.json`: локальный сервер `python -m http.server 8123` для проверки (`preview_start nabor`).
 
+## Публикация
+
+Сайт на GitHub Pages: https://nikirau.github.io/nabor-6325e6/ (репозиторий `Nikirau/nabor-6325e6`, ветка `main`, корень). Выкладка: коммит и `git push origin main`, через 1–2 минуты обновление на сайте. Установленные PWA подхватывают его при следующем открытии с интернетом. Коммитить от имени `Nikirau <51199751+Nikirau@users.noreply.github.com>` (задано в локальном git config), личную почту не использовать. `gh` не установлен, Pages уже включены.
+
 ## Как запускать и проверять
 
 Service worker и установка PWA работают только по `http://localhost` или `https://`, не по `file://`. Для проверки запустить `python -m http.server 8123` в папке проекта и открыть `http://localhost:8123/`. Сама страница открывается и по `file://` (двойной клик), но без service worker, а данные `localStorage` у `file://` и у `localhost` разные.
